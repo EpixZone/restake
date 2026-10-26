@@ -1,6 +1,5 @@
 import _ from 'lodash'
-import { multiply, ceil, bignumber } from 'mathjs'
-import Long from "long";
+import { bignumber } from 'mathjs'
 
 import {
   defaultRegistryTypes as defaultStargateTypes,
@@ -8,13 +7,14 @@ import {
   GasPrice
 } from "@cosmjs/stargate";
 import { sleep } from "@cosmjs/utils";
-import { makeSignDoc, Registry } from "@cosmjs/proto-signing";
+import { Registry } from "@cosmjs/proto-signing";
 import { toBase64, fromBase64 } from '@cosmjs/encoding'
 import { PubKey } from "cosmjs-types/cosmos/crypto/secp256k1/keys.js";
 import { SignMode } from "cosmjs-types/cosmos/tx/signing/v1beta1/signing.js";
 import { AuthInfo, Fee, TxBody, TxRaw } from "cosmjs-types/cosmos/tx/v1beta1/tx.js";
 
 import { coin, get, post } from './Helpers.mjs'
+import { uint64 } from './Uint64.mjs'
 
 function SigningClient(network, signer) {
 
@@ -60,7 +60,11 @@ function SigningClient(network, signer) {
           value = nestedAccount
         }
 
-        return value
+        return {
+          ...value,
+          account_number: uint64(value.account_number, 'account_number').toString(),
+          sequence: uint64(value.sequence, 'sequence').toString(),
+        }
       })
       .catch((error) => {
         if(error.response?.status === 404){
@@ -74,9 +78,10 @@ function SigningClient(network, signer) {
   // vendored to handle large integers
   // https://github.com/cosmos/cosmjs/blob/0f0c9d8a754cbf01e17acf51d3f2dbdeaae60757/packages/stargate/src/fee.ts
   function calculateFee(gasLimit, gasPrice) {
+    gasLimit = uint64(gasLimit, 'gas_limit').toString();
     const processedGasPrice = typeof gasPrice === "string" ? GasPrice.fromString(gasPrice) : gasPrice;
     const { denom, amount: gasPriceAmount } = processedGasPrice;
-    const amount = ceil(bignumber(multiply(bignumber(gasPriceAmount.toString()), bignumber(gasLimit.toString()))));
+    const amount = bignumber(gasPriceAmount.toString()).mul(gasLimit).ceil();
     return {
       amount: [coin(amount, denom)],
       gas: gasLimit.toString()
@@ -84,7 +89,7 @@ function SigningClient(network, signer) {
   }
 
   function getFee(gas, gasPrice) {
-    if (!gas)
+    if (gas === undefined)
       gas = 200000;
     return calculateFee(gas, gasPrice || defaultGasPrice);
   }
@@ -97,7 +102,7 @@ function SigningClient(network, signer) {
   }
 
   async function signAndBroadcast(address, messages, gas, memo, gasPrice) {
-    if (!gas)
+    if (gas === undefined)
       gas = await simulate(address, messages, memo);
     const fee = getFee(gas, gasPrice);
     const txBody = await sign(address, messages, memo, fee)
@@ -128,23 +133,19 @@ function SigningClient(network, signer) {
       }
     };
 
-    const response = await post(restUrl + '/cosmos/tx/v1beta1/txs', {
-      tx_bytes: toBase64(TxRaw.encode(txBody).finish()),
-      mode: "BROADCAST_MODE_SYNC"
-    })
-    const result = parseTxResult(response.data.tx_response)
-    assertIsDeliverTxSuccess(result)
-    return pollForTx(result.transactionHash).then(
-      (value) => {
-        clearTimeout(txPollTimeout);
-        assertIsDeliverTxSuccess(value)
-        return value
-      },
-      (error) => {
-        clearTimeout(txPollTimeout);
-        return error
-      },
-    )
+    try {
+      const response = await post(restUrl + '/cosmos/tx/v1beta1/txs', {
+        tx_bytes: toBase64(TxRaw.encode(txBody).finish()),
+        mode: "BROADCAST_MODE_SYNC"
+      })
+      const result = parseTxResult(response.data.tx_response)
+      assertIsDeliverTxSuccess(result)
+      const committed = await pollForTx(result.transactionHash)
+      assertIsDeliverTxSuccess(committed)
+      return committed
+    } finally {
+      clearTimeout(txPollTimeout);
+    }
   }
 
   async function sign(address, messages, memo, fee){
@@ -152,11 +153,16 @@ function SigningClient(network, signer) {
     const { account_number: accountNumber, sequence } = account
     const txBodyBytes = makeBodyBytes(messages, memo)
     // Sign using standard protobuf messages
-    const authInfoBytes = await makeAuthInfoBytes(account, {
+    const authInfoBytes = await makeAuthInfoBytes(address, account, {
       amount: fee.amount,
       gasLimit: fee.gas,
     }, SignMode.SIGN_MODE_DIRECT)
-    const signDoc = makeSignDoc(txBodyBytes, authInfoBytes, chainId, accountNumber);
+    const signDoc = {
+      bodyBytes: txBodyBytes,
+      authInfoBytes,
+      chainId,
+      accountNumber: uint64(accountNumber, 'account_number'),
+    };
     const { signature, signed } = await signer.signDirect(address, signDoc);
     return {
       bodyBytes: signed.bodyBytes,
@@ -166,11 +172,20 @@ function SigningClient(network, signer) {
   }
 
   async function simulate(address, messages, memo, modifier) {
+    let gasModifier
+    try {
+      const value = modifier ?? defaultGasModifier
+      if (!['number', 'string'].includes(typeof value)) throw new Error()
+      gasModifier = bignumber(value.toString())
+      if (!gasModifier.isFinite() || gasModifier.lte(0)) throw new Error()
+    } catch {
+      throw new Error('Invalid gas modifier')
+    }
     const account = await getAccount(address)
     const fee = getFee(100_000)
     const txBody = {
       bodyBytes: makeBodyBytes(messages, memo),
-      authInfoBytes: await makeAuthInfoBytes(account, {
+      authInfoBytes: await makeAuthInfoBytes(address, account, {
         amount: fee.amount,
         gasLimit: fee.gas,
       }, SignMode.SIGN_MODE_UNSPECIFIED),
@@ -181,7 +196,10 @@ function SigningClient(network, signer) {
       const estimate = await post(restUrl + '/cosmos/tx/v1beta1/simulate', {
         tx_bytes: toBase64(TxRaw.encode(txBody).finish()),
       }).then(el => el.data.gas_info.gas_used)
-      return (parseInt(estimate * (modifier || defaultGasModifier)));
+      const gasUsed = uint64(estimate, 'simulated gas').toString()
+      const gasLimit = bignumber(gasUsed).mul(gasModifier).ceil()
+      if (gasLimit.gt('18446744073709551615')) throw new Error('Invalid uint64 gas_limit')
+      return uint64(gasLimit.toFixed(0), 'gas_limit').toString()
     } catch (error) {
       throw new Error(error.response?.data?.message || error.message)
     }
@@ -208,11 +226,11 @@ function SigningClient(network, signer) {
     ).finish()
   }
 
-  async function makeAuthInfoBytes(account, fee, mode){
+  async function makeAuthInfoBytes(address, account, fee, mode){
     const { sequence } = account
-    const accountFromSigner = (await signer.getAccounts())[0]
+    const accountFromSigner = (await signer.getAccounts()).find(account => account.address === address)
     if (!accountFromSigner) {
-      throw new Error("Failed to retrieve account from signer");
+      throw new Error("Requested account is not available from signer");
     }
     const signerPubkey = accountFromSigner.pubkey;
     return AuthInfo.encode({
@@ -224,11 +242,11 @@ function SigningClient(network, signer) {
               key: signerPubkey,
             }).finish(),
           },
-          sequence: Long.fromNumber(sequence, true),
+          sequence: uint64(sequence, 'sequence'),
           modeInfo: { single: { mode: mode } },
         },
       ],
-      fee: Fee.fromPartial(fee),
+      fee: Fee.fromPartial({ ...fee, gasLimit: uint64(fee.gasLimit, 'gas_limit') }),
     }).finish()
   }
 
